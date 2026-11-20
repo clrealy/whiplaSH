@@ -1,0 +1,219 @@
+echo hello world
+---
+echo "double $HOME-ish" 'single $HOME' \$escaped
+---
+x=5; y="a b"; echo $x "$y" ${x} "${y}"
+---
+a="1  2   3"; echo $a; echo "$a"; for w in $a; do echo "[$w]"; done
+---
+echo one | tr a-z A-Z | rev
+---
+true && echo yes || echo no; false && echo yes || echo no
+---
+false; echo $?; true; echo $?
+---
+if [ 1 -lt 2 ]; then echo lt; elif true; then echo nope; else echo else; fi
+---
+if [ "a" = "b" ]; then echo eq; else echo ne; fi
+---
+for i in 1 2 3; do echo "i=$i"; done
+---
+i=0; while [ $i -lt 3 ]; do echo $i; i=$((i+1)); done
+---
+i=0; until [ $i -ge 2 ]; do echo u$i; i=$((i + 1)); done
+---
+for i in a b c d; do [ $i = c ] && break; echo $i; done; echo after
+---
+for i in 1 2 3 4; do [ $i = 2 ] && continue; echo $i; done
+---
+for i in 1 2; do for j in a b; do [ $j = b ] && continue 2; echo $i$j; done; done
+---
+case hello in h*) echo starts-h;; *) echo other;; esac
+---
+x=foo.tar.gz; case $x in *.zip) echo zip;; *.tar.*|*.tgz) echo tarball;; esac
+---
+f() { echo "args: $# first=$1 all=$*"; return 3; }; f a "b c" d; echo "rc=$?"
+---
+greet() { local name=$1; echo "hi $name"; }; name=outer; greet inner; echo $name
+---
+count() { echo $#; }; count; count ''; count a b; set -- x y z; count "$@"; count "$*"
+---
+set -- "a b" c; for a in "$@"; do echo "<$a>"; done; for a in $@; do echo "[$a]"; done
+---
+echo $((2 + 3 * 4)) $((10 / 3)) $((10 % 3)) $((2 ** 10)) $(( (1+2) * 3 )) $((-5 + 2))
+---
+x=7; echo $((x > 5 ? 1 : 0)) $((x++)) $x $((++x)) $((x += 10)) $x
+---
+echo $((0x1f)) $((010)) $((2#101)) $((1 << 4)) $((7 & 3)) $((5 | 2)) $((!0))
+---
+((n = 3 * 3)); echo $n; ((n > 5)) && echo big
+---
+echo $(echo inner) "$(echo "quoted inner")" `echo backtick`
+---
+echo "nested: $(echo $(echo deep))"
+---
+v=$(printf 'a\nb\n\n\n'); echo "[$v]"
+---
+s="hello world"; echo ${#s} ${s:0:5} ${s:6} ${s: -3} ${s:2:3}
+---
+p=/usr/local/lib/libfoo.so.1; echo ${p##*/} ${p#*/} ${p%/*} ${p%%.*}
+---
+s="aXbXc"; echo ${s/X/-} ${s//X/-} ${s/#a/A} ${s/%c/C}
+---
+unset u; echo "${u:-default}" "${u-dash}" "${u:+plus}"; u=set; echo "${u:-default}" "${u:+plus}"
+---
+unset u; echo ${u:=assigned}; echo $u
+---
+s=MiXeD; echo ${s^^} ${s,,} ${s^} 
+---
+echo ~ | grep -c /
+---
+cd /tmp && pwd; cd - >/dev/null; [ "$PWD" != /tmp ] && echo back
+---
+cd /usr/bin && cd .. && pwd
+---
+echo hi > out.txt; cat out.txt; echo again >> out.txt; cat out.txt; wc -l < out.txt
+---
+ls /nonexistent 2>/dev/null; echo "rc=$?"; ls /nonexistent 2>&1 | grep -c nonexistent
+---
+{ echo a; echo b; } > grp.txt; cat grp.txt
+---
+(cd /; pwd); pwd | grep -vc '^/$'
+---
+x=1; (x=2; echo in $x); echo out $x
+---
+cat <<EOF
+heredoc $HOME_NOT_SET line
+  indented $((1+1))
+EOF
+---
+cat <<'EOF'
+literal $HOME $(nope)
+EOF
+---
+cat <<-EOF
+	tab stripped
+	EOF
+---
+read a b <<< "one two three"; echo "$a|$b"
+---
+printf 'x y z\n1 2 3\n' | while read a b c; do echo "$c $b $a"; done
+---
+IFS=: read -r user pass rest <<< "root:x:0:0"; echo $user $pass $rest
+---
+echo a,b,c | { IFS=, read x y z; echo $y; }
+---
+export FOO=bar; sh -c 'echo $FOO'; BAZ=qux sh -c 'echo $BAZ'; echo "[$BAZ]"
+---
+f=nope; command -v ls >/dev/null && echo has-ls; type -t cd; type -t if
+---
+alias hi='echo hello from alias'
+hi there
+---
+echo *.txt | wc -w; touch z1.tmp z2.tmp; echo z*.tmp; echo "z*.tmp"; echo nomatch*.qq
+---
+test -d /tmp && echo dir; test -f /etc/hostname -o -f /etc/passwd && echo file; [ ! -e /nope ] && echo missing
+---
+[ -z "" ] && echo empty; [ -n "x" ] && echo nonempty; [ abc ] && echo str; [ "" ] || echo falsy
+---
+[[ foo == f* ]] && echo glob; [[ "a b" == "a b" ]] && echo spaces; [[ -n $UNSET_THING ]] || echo unset
+---
+[[ 5 -gt 3 && 2 -lt 4 ]] && echo both; [[ ! -e /nope ]] && echo not; [[ (1 -eq 1) || x == y ]] && echo paren
+---
+set -e; true; echo still; false; echo never
+---
+set -e; if false; then :; fi; false || true; ! false; echo survived
+---
+set -u; echo ${UNSET_VAR_XYZ:-ok}; echo $UNSET_VAR_XYZ; echo nope
+---
+set -o pipefail; false | true; echo $?; set +o pipefail; false | true; echo $?
+---
+exit 7
+---
+f() { exit 3; }; f; echo unreachable
+---
+(exit 4); echo $?
+---
+! true; echo $?; ! false; echo $?
+---
+echo a; # comment here
+echo b # trailing
+---
+echo 'it'"'"'s'; echo "tab:\t"; echo -e "tab:\tend"; echo -n no-newline; echo
+---
+eval 'x=42; echo $x'; cmd='echo evaled'; eval $cmd
+---
+x=outer; f() { x=inner; }; f; echo $x
+---
+fact() { if [ $1 -le 1 ]; then echo 1; else echo $(( $1 * $(fact $(( $1 - 1 ))) )); fi; }; fact 6
+---
+seq 1 5 | sort -r | head -2
+---
+echo $# $0 | wc -w
+---
+arr="x y z"; set -- $arr; echo $1 $3 $#; shift; echo $1 $#; shift 2; echo $#
+---
+x=; [ -z "$x" ] && echo empty-assign; y=""; echo "[$y]"
+---
+echo "a\"b" 'c\d' e\ f "\$x" "back\\slash"
+---
+foo=bar; echo "${foo}baz" $foo-baz "$foo"_x
+---
+for f in /etc/host*; do [ -e "$f" ] && echo found; break; done
+---
+echo $(( $(echo 4) + 1 ))
+---
+true | false; echo $?
+---
+cat <<EOF | tr a-z A-Z
+piped heredoc
+EOF
+---
+i=0; while true; do i=$((i+1)); [ $i -ge 3 ] && break; done; echo $i
+---
+x=hello; echo ${x:1:2}${x:0:1}
+---
+echo 1 2>/dev/null 3
+---
+echo err >&2 2>/dev/null; echo done
+---
+exec 3>fd3.txt; echo via3 >&3; exec 3>&-; cat fd3.txt
+---
+v=$(exit 5); echo $?
+---
+echo $((1/0)); echo after
+---
+echo "$@" "$*" $#
+---
+printf '%s-%s\n' a b c d
+---
+x='$HOME'; echo $x "$x"
+---
+echo {a,b} 'brace' # no brace expansion yet in POSIX sh mode
+---
+while read -r line; do echo "> $line"; done <<EOF
+first
+second line
+EOF
+---
+f() { echo "in f: $1"; }; g() { f "$@"; f "$*"; }; g a b
+---
+n=0; for x in a b c; do n=$((n+1)); done; echo $n
+---
+case "$HOME" in /*) echo absolute;; esac; case x in [abc]) echo abc;; [x-z]) echo xyz;; esac
+---
+echo "$(( 3 > 2 )) $(( 2 > 3 )) $(( 3 == 3 )) $(( 1 && 0 )) $(( 1 || 0 ))"
+---
+unset x; x+=a; x+=b; echo $x
+---
+while getopts "ab:c" opt -a -b val -c rest; do echo "opt=$opt arg=${OPTARG-}"; done; echo "OPTIND=$OPTIND"
+---
+set -- -xvf file.tar other; while getopts xvf: o; do echo "$o ${OPTARG-}"; done; shift $((OPTIND-1)); echo "left: $*"
+---
+while getopts ":a" o -z -a; do echo "$o ${OPTARG-}"; done
+---
+f() ( echo "subshell func $1" ); f ok
+---
+echo {1..5} {a..c} x{1,2}y {05..07} {1..10..4}
+---
+for f in a{b,c}; do echo $f; done
