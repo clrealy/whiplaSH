@@ -217,3 +217,51 @@ f() ( echo "subshell func $1" ); f ok
 echo {1..5} {a..c} x{1,2}y {05..07} {1..10..4}
 ---
 for f in a{b,c}; do echo $f; done
+---
+a=(one two "three four"); echo ${a[0]} ${a[2]}; echo ${#a[@]}; for x in "${a[@]}"; do echo "<$x>"; done
+---
+a=(x y z); a[5]=late; echo "${a[@]}"; echo ${!a[@]}; echo ${#a[@]}; echo $a
+---
+a=(1 2); a+=(3 4); a[1]+=0; echo "${a[*]}"; unset 'a[0]'; echo "${a[@]}" ${#a[@]}
+---
+a=(a b c d e); echo "${a[@]:1:2}" "${a[@]: -2}" "${a[-1]}"
+---
+declare -A m; m[apple]=red; m[banana]=yellow; m["kiwi fruit"]=green; echo ${m[apple]} ${#m[@]}; for k in "${!m[@]}"; do echo "$k=${m[$k]}"; done | sort
+---
+declare -A cfg=([host]=localhost [port]=8080); echo "${cfg[host]}:${cfg[port]}"
+---
+f() { local -a arr=(p q r); echo ${arr[1]}; local x="a b"; echo "$x"; }; f
+---
+arr=(); echo "empty:${#arr[@]}"; for x in "${arr[@]}"; do echo never; done; echo done
+---
+nums=(3 1 2); i=0; total=0; while [ $i -lt ${#nums[@]} ]; do total=$((total + nums[i])); i=$((i+1)); done; echo $total
+---
+a=(x y); ((a[1] = 7 * 6)); echo ${a[1]}
+---
+files=(alpha beta); echo "${files[@]/a/A}" "${files[@]^^}" "${#files[1]}"
+---
+read -a parts <<< "red green blue"; echo ${parts[1]} ${#parts[@]}
+---
+v=target; target=hit; echo ${!v}
+---
+s="a b c"; arr=($s); echo ${#arr[@]} ${arr[2]}
+---
+declare -a list=(10 20); declare -p list
+---
+trap 'echo cleanup $?' EXIT; echo working; exit 3
+---
+trap 'echo caught USR1' USR1; kill -USR1 $$; echo after
+---
+trap 'echo err trapped' ERR; false; echo next; true
+---
+f() { trap 'echo inner exit' EXIT; }; ( trap 'echo sub exit' EXIT; echo in sub ); echo main
+---
+trap '' INT; trap -p | grep -c INT; trap - INT; trap -p | grep -c INT
+---
+sleep 0.2 & pid=$!; kill $pid; wait $pid; echo "rc=$?"
+---
+sleep 0.1 & sleep 0.1 & wait; echo all done
+---
+( exit 9 ) & wait $!; echo $?
+---
+set -e; trap 'echo on exit' EXIT; false; echo never

@@ -43,6 +43,22 @@ fn lex(s: &str) -> Result<Vec<T>, String> {
             while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_') {
                 i += 1;
             }
+            // array element: name[expr]
+            if i < b.len() && b[i] == '[' {
+                let mut depth = 0;
+                while i < b.len() {
+                    if b[i] == '[' {
+                        depth += 1;
+                    } else if b[i] == ']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
             out.push(T::Name(b[st..i].iter().collect()));
             continue;
         }
@@ -125,7 +141,13 @@ impl P<'_> {
         }
     }
     fn var(&mut self, n: &str) -> Result<i64, String> {
-        let v = self.sh.get_var(n).unwrap_or_default();
+        let v = match n.split_once('[') {
+            Some((name, rest)) => self
+                .sh
+                .get_elem(name, rest.strip_suffix(']').unwrap_or(rest))?
+                .unwrap_or_default(),
+            None => self.sh.get_var(n).unwrap_or_default(),
+        };
         let v = v.trim();
         if v.is_empty() {
             return Ok(0);
@@ -134,7 +156,16 @@ impl P<'_> {
     }
     fn set(&mut self, n: &str, v: i64) {
         if self.live {
-            self.sh.set_var(n, &v.to_string());
+            match n.split_once('[') {
+                Some((name, rest)) => {
+                    let _ = self.sh.set_elem(
+                        name,
+                        rest.strip_suffix(']').unwrap_or(rest),
+                        &v.to_string(),
+                    );
+                }
+                None => self.sh.set_var(n, &v.to_string()),
+            }
         }
     }
 

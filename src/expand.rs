@@ -351,11 +351,45 @@ impl Shell {
         quoted: bool,
     ) -> Result<(), ExpandError> {
         let b: Vec<char> = inner.chars().collect();
-        // ${#name}
+        // ${!name[@]} keys, ${!name} indirection
+        if b.first() == Some(&'!') && b.len() > 1 {
+            let body: String = b[1..].iter().collect();
+            if let Some(n) = body
+                .strip_suffix("[@]")
+                .or_else(|| body.strip_suffix("[*]"))
+            {
+                let keys = self.array_keys(n);
+                push_list(out, &keys, quoted && body.ends_with("[@]"), quoted, self);
+                return Ok(());
+            }
+            let target = self.special_or_var(&body).unwrap_or_default();
+            if target.is_empty() {
+                return Err(ExpandError(format!("{body}: invalid indirect expansion")));
+            }
+            let inner2 = target;
+            return self.brace_param(&inner2, out, quoted);
+        }
+        // ${#...}
         if b.first() == Some(&'#') && b.len() > 1 {
             let name: String = b[1..].iter().collect();
             let v = if name == "@" || name == "*" {
                 Some(self.positional.len().to_string())
+            } else if let Some(n) = name
+                .strip_suffix("[@]")
+                .or_else(|| name.strip_suffix("[*]"))
+            {
+                Some(match self.vars.get(n) {
+                    Some(crate::shell::Var { arr: Some(_), .. }) => {
+                        self.array_values(n).len().to_string()
+                    }
+                    Some(_) => "1".into(),
+                    None => "0".into(),
+                })
+            } else if let Some((n, rest)) = name.split_once('[') {
+                let k = rest.strip_suffix(']').unwrap_or(rest);
+                self.get_elem(n, k)
+                    .map_err(ExpandError)?
+                    .map(|v| v.chars().count().to_string())
             } else {
                 self.lookup(&name)?.map(|v| v.chars().count().to_string())
             };
@@ -384,13 +418,89 @@ impl Shell {
             return Err(ExpandError(format!("${{{inner}}}: bad substitution")));
         }
         let name: String = b[..j].iter().collect();
+        // optional [subscript]
+        let mut sub: Option<String> = None;
+        if b.get(j) == Some(&'[') {
+            let mut depth = 0;
+            let mut k = j;
+            while k < b.len() {
+                if b[k] == '[' {
+                    depth += 1;
+                } else if b[k] == ']' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            sub = Some(b[j + 1..k.min(b.len())].iter().collect());
+            j = (k + 1).min(b.len());
+        }
         let rest: String = b[j..].iter().collect();
         if name == "@" && quoted && rest.is_empty() {
             let s: Vec<char> = "$@".chars().collect();
             self.dollar(&s, 0, out, true)?;
             return Ok(());
         }
-        let val = self.special_or_var(&name);
+        // whole-array forms: ${a[@]} ${a[*]} and ops applied to each element
+        if let Some(sb) = sub.as_deref().filter(|s| *s == "@" || *s == "*") {
+            let mut vals = self.array_values(&name);
+            if let Some(r) = rest
+                .strip_prefix(':')
+                .filter(|r| !r.starts_with(['-', '=', '+', '?']))
+            {
+                let (o, l) = match split_unescaped_opt(r, ':') {
+                    Some((a, b)) => (a, Some(b)),
+                    None => (r.to_string(), None),
+                };
+                let oe = self.expand_arith(&o)?;
+                let off = crate::arith::eval_str(self, &oe).map_err(ExpandError)?;
+                let n = vals.len() as i64;
+                let st = if off < 0 {
+                    (n + off).max(0)
+                } else {
+                    off.min(n)
+                } as usize;
+                let en = match l {
+                    Some(l) => {
+                        let le = self.expand_arith(&l)?;
+                        let len = crate::arith::eval_str(self, &le).map_err(ExpandError)?;
+                        (st + len.max(0) as usize).min(vals.len())
+                    }
+                    None => vals.len(),
+                };
+                vals = vals[st..en.max(st)].to_vec();
+            } else if !rest.is_empty() {
+                let mut mapped = Vec::new();
+                for v in vals {
+                    if let Some(r) = self.param_op(&name, None, Some(v), &rest)? {
+                        mapped.push(r);
+                    }
+                }
+                vals = mapped;
+            }
+            push_list(out, &vals, quoted && sb == "@", quoted, self);
+            return Ok(());
+        }
+        let val = match &sub {
+            Some(k) => self.get_elem(&name, k).map_err(ExpandError)?,
+            None => self.special_or_var(&name),
+        };
+        let result = self.param_op(&name, sub.as_deref(), val, &rest)?;
+        push_str(out, &result.unwrap_or_default(), quoted, true);
+        Ok(())
+    }
+
+    /// The ${name<op>...} operators on one value.
+    fn param_op(
+        &mut self,
+        name: &str,
+        sub: Option<&str>,
+        val: Option<String>,
+        rest: &str,
+    ) -> Result<Option<String>, ExpandError> {
+        let rest = rest.to_string();
         let set = val.is_some();
         let nonempty = val.as_deref().is_some_and(|v| !v.is_empty());
 
@@ -417,7 +527,10 @@ impl Shell {
                         val
                     } else {
                         let w = self.expand_string(word)?;
-                        self.set_var(&name, &w);
+                        match sub {
+                            Some(k) => self.set_elem(name, k, &w).map_err(ExpandError)?,
+                            None => self.set_var(name, &w),
+                        }
                         Some(w)
                     }
                 }
@@ -526,10 +639,9 @@ impl Shell {
                 }
             })
         } else {
-            return Err(ExpandError(format!("${{{inner}}}: bad substitution")));
+            return Err(ExpandError(format!("${{{name}{rest}}}: bad substitution")));
         };
-        push_str(out, &result.unwrap_or_default(), quoted, true);
-        Ok(())
+        Ok(result)
     }
 
     fn split_and_glob(&mut self, items: Vec<It>) -> Vec<String> {
@@ -611,10 +723,9 @@ impl Shell {
                 libc::close(fds[0]);
                 libc::dup2(fds[1], 1);
                 libc::close(fds[1]);
-                self.in_subshell = true;
-                self.interactive = false;
+                self.child_setup(-1, false);
                 let code = self.run_source(cmd, false);
-                crate::shell::flush_and_exit(code);
+                self.exit_now(code);
             }
             libc::close(fds[1]);
             let mut buf = Vec::new();
@@ -938,6 +1049,30 @@ fn join(base: &str, name: &str) -> String {
         format!("{base}{name}")
     } else {
         format!("{base}/{name}")
+    }
+}
+
+/// Push a list of values: separate fields for "${a[@]}", joined for "${a[*]}".
+fn push_list(out: &mut Vec<It>, vals: &[String], separate: bool, quoted: bool, sh: &Shell) {
+    if !separate && quoted {
+        let sep = sh
+            .get_var("IFS")
+            .map(|s| s.chars().next().map(|c| c.to_string()).unwrap_or_default())
+            .unwrap_or(" ".into());
+        push_str(out, &vals.join(&sep), true, true);
+        return;
+    }
+    if vals.is_empty() && quoted {
+        out.push(It::EmptyAt);
+    }
+    for (n, v) in vals.iter().enumerate() {
+        if n > 0 {
+            out.push(It::Break);
+        }
+        if v.is_empty() && quoted {
+            out.push(It::C('\0', true, false));
+        }
+        push_str(out, v, quoted, true);
     }
 }
 

@@ -45,12 +45,25 @@ Expansions: `$var` `${var}` `${#var}` `${var:-x}` `${var:=x}` `${var:+x}` `${var
 brace expansion `{a,b}` `{1..10}` `{01..05}`, globs `* ? [a-z] [[:alpha:]]`,
 word splitting with `IFS`, `"$@"`, `$'…'` strings.
 
+Arrays: `a=(x y "z w")`, `a+=(more)`, `a[5]=v`, `${a[i]}`, `${a[-1]}`, `"${a[@]}"`,
+`${#a[@]}`, `${!a[@]}`, `${a[@]:1:2}`, `${a[@]/x/y}`, `unset 'a[1]'`, `read -a`,
+`a[i]` inside `$(( ))`, associative arrays with `declare -A m=([key]=val)`, `declare -p`,
+indirection `${!name}`.
+
 Redirections: `<` `>` `>>` `<>` `2>&1` `>&-` `&>` `&>>` `|&`, heredocs `<<EOF`
 `<<'EOF'` `<<-EOF`, here-strings `<<<`, `exec 3>file`.
 
 Builtins: `cd pwd echo read test [ [[ ]] export unset set shift source . eval exec
 exit return break continue local declare alias unalias type command builtin let
-getopts wait jobs umask history help` + fish's `and or not functions`.
+getopts trap wait jobs fg bg kill disown umask history help` + fish's `and or not functions`.
+
+## Job control & traps
+
+- **Ctrl-Z** stops the running program: `[1]+  Stopped  sleep 30`. Then `fg`, `bg`, `jobs`,
+  `kill %1`, `disown`. Ctrl-C only hits the program, never the shell.
+- Finished background jobs are reported before the next prompt (`Done`, `Exit 3`, `Terminated`).
+- `trap 'cmd' EXIT INT TERM USR1 ERR …`, `trap - SIG`, `trap '' SIG` (ignore), `trap -p`.
+  Subshells start with clean traps, like bash.
 
 Options: `set -e`, `set -u`, `set -x`, `set -f`, `set -o pipefail` (also as command-line flags).
 
@@ -67,16 +80,17 @@ cargo build --release
 
 ```sh
 cargo test
-sh tests/compat.sh   # 103 scripts run through bash AND whiplaSH; output + exit codes must match
-sh tests/fish.sh     # fish-style syntax
+sh tests/compat.sh      # 127 scripts run through bash AND whiplaSH; output + exit codes must match
+sh tests/fish.sh        # fish-style syntax
+python3 tests/interactive.py   # a real terminal session: Ctrl-Z, fg/bg, kill %1, Ctrl-C
 ```
 
 It also runs real system scripts like `ldd` and `which` unchanged.
 
 ## Not yet
 
-Arrays, `=~` regex in `[[ ]]`, job control (`fg`/`bg`/Ctrl-Z), `trap`, `printf` as a
-builtin (the external one is used), process substitution `<( )`, `select`.
+`=~` regex in `[[ ]]`, `printf` as a builtin (the external one is used), process
+substitution `<( )`, `select`, `coproc`.
 
 ## Things to know
 

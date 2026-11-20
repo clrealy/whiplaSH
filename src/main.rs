@@ -5,6 +5,7 @@ mod ast;
 mod builtins;
 mod editor;
 mod expand;
+mod jobs;
 mod parser;
 mod pattern;
 mod shell;
@@ -105,7 +106,7 @@ fn main() {
 
     if let Some(cmd) = command {
         let code = sh.run_source(&cmd, true);
-        shell::flush_and_exit(code);
+        sh.exit_now(code);
     }
     if let Some(path) = script {
         let text = match std::fs::read(&path) {
@@ -121,12 +122,12 @@ fn main() {
         };
         sh.source_name = path.clone();
         let code = run_chunks(&mut sh, text.lines().map(|l| l.to_string()));
-        shell::flush_and_exit(code);
+        sh.exit_now(code);
     }
     let stdin_tty = std::io::stdin().is_terminal();
     if !stdin_tty && !force_interactive {
         let code = run_chunks(&mut sh, StdinLines);
-        shell::flush_and_exit(code);
+        sh.exit_now(code);
     }
     interactive(&mut sh, norc);
 }
@@ -253,6 +254,17 @@ fn interactive(sh: &mut Shell, norc: bool) {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
         libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        // job control: our own process group, owning the terminal
+        if libc::isatty(0) == 1 {
+            let pid = libc::getpid();
+            libc::setpgid(0, pid);
+            if libc::tcsetpgrp(0, pid) == 0 {
+                sh.shell_pgid = pid;
+                sh.job_control = true;
+            }
+        }
     }
     let config = Config::builder()
         .history_ignore_space(true)
@@ -339,7 +351,7 @@ fn interactive(sh: &mut Shell, norc: bool) {
                 match parser::parse(&line) {
                     Ok(list) => {
                         if let Flow::Exit(c) = sh.run_list(&list) {
-                            shell::flush_and_exit(c);
+                            sh.exit_now(c);
                         }
                     }
                     Err(parser::ParseError::Incomplete) => {
@@ -357,8 +369,12 @@ fn interactive(sh: &mut Shell, norc: bool) {
                 continue;
             }
             Err(ReadlineError::Eof) => {
+                if sh.jobs.iter().any(|j| j.stopped) {
+                    eprintln!("There are stopped jobs.");
+                }
                 println!("exit");
-                shell::flush_and_exit(sh.last_status);
+                let c = sh.last_status;
+                sh.exit_now(c);
             }
             Err(e) => {
                 eprintln!("whiplash: {e}");

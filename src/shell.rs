@@ -8,10 +8,20 @@ use std::io::Write;
 use std::rc::Rc;
 use std::time::Instant;
 
+pub use crate::jobs::Job;
+
 #[derive(Clone, Debug)]
 pub struct Var {
+    /// scalar value (for an indexed array: element 0)
     pub value: String,
     pub exported: bool,
+    pub arr: Option<Arr>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Arr {
+    Indexed(BTreeMap<i64, String>),
+    Assoc(BTreeMap<String, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,12 +31,6 @@ pub enum Flow {
     Continue(u32),
     Return,
     Exit(i32),
-}
-
-pub struct Job {
-    pub id: usize,
-    pub pid: i32,
-    pub cmd: String,
 }
 
 pub struct Shell {
@@ -56,6 +60,10 @@ pub struct Shell {
     pub subst_count: u64,
     /// getopts: position inside the current bundled option arg (-abc)
     pub getopts_pos: usize,
+    pub job_control: bool,
+    pub shell_pgid: i32,
+    pub traps: HashMap<i32, String>,
+    pub in_trap: bool,
 }
 
 /// Flush Rust's stdout buffer and leave the process right now (for forked children).
@@ -102,6 +110,7 @@ impl Shell {
                 Var {
                     value: v.to_string_lossy().into_owned(),
                     exported: true,
+                    arr: None,
                 },
             );
         }
@@ -114,6 +123,7 @@ impl Shell {
             Var {
                 value: (lvl + 1).to_string(),
                 exported: true,
+                arr: None,
             },
         );
         if let Ok(cwd) = std::env::current_dir() {
@@ -129,6 +139,7 @@ impl Shell {
                     Var {
                         value: cwd.display().to_string(),
                         exported: true,
+                        arr: None,
                     },
                 );
             }
@@ -136,6 +147,7 @@ impl Shell {
         vars.entry("IFS".into()).or_insert(Var {
             value: " \t\n".into(),
             exported: false,
+            arr: None,
         });
         // SAFETY: getpid/getppid can't fail
         let pid = unsafe { libc::getpid() };
@@ -145,6 +157,7 @@ impl Shell {
             Var {
                 value: ppid.to_string(),
                 exported: false,
+                arr: None,
             },
         );
         vars.insert(
@@ -152,6 +165,7 @@ impl Shell {
             Var {
                 value: env!("CARGO_PKG_VERSION").into(),
                 exported: false,
+                arr: None,
             },
         );
         Shell {
@@ -179,6 +193,10 @@ impl Shell {
             source_name: "whiplash".into(),
             subst_count: 0,
             getopts_pos: 1,
+            job_control: false,
+            shell_pgid: pid,
+            traps: HashMap::new(),
+            in_trap: false,
         }
     }
 
@@ -217,6 +235,7 @@ impl Shell {
                     Var {
                         value: value.to_string(),
                         exported: false,
+                        arr: None,
                     },
                 );
             }
@@ -227,6 +246,7 @@ impl Shell {
         let v = self.vars.entry(name.to_string()).or_insert(Var {
             value: String::new(),
             exported: true,
+            arr: None,
         });
         v.exported = true;
         if let Some(val) = value {
@@ -236,6 +256,245 @@ impl Shell {
 
     pub fn unset_var(&mut self, name: &str) {
         self.vars.remove(name);
+    }
+
+    // ---------- arrays ----------
+
+    pub fn is_assoc(&self, name: &str) -> bool {
+        matches!(
+            self.vars.get(name).and_then(|v| v.arr.as_ref()),
+            Some(Arr::Assoc(_))
+        )
+    }
+
+    /// Make `name` an (empty) array of the given kind, keeping a scalar as element 0.
+    pub fn declare_array(&mut self, name: &str, assoc: bool) {
+        let v = self.vars.entry(name.to_string()).or_insert(Var {
+            value: String::new(),
+            exported: false,
+            arr: None,
+        });
+        if v.arr.is_none() {
+            v.arr = Some(if assoc {
+                Arr::Assoc(BTreeMap::new())
+            } else {
+                let mut m = BTreeMap::new();
+                if !v.value.is_empty() {
+                    m.insert(0, v.value.clone());
+                }
+                Arr::Indexed(m)
+            });
+        }
+    }
+
+    /// Resolve an indexed-array subscript (arithmetic; negative counts from the end).
+    fn index_of(&mut self, name: &str, key: &str) -> Result<i64, String> {
+        let e = self.expand_arith(key).map_err(|e| e.0)?;
+        let i = crate::arith::eval_str(self, &e)?;
+        if i < 0 {
+            let max = match self.vars.get(name).and_then(|v| v.arr.as_ref()) {
+                Some(Arr::Indexed(m)) => m.keys().next_back().copied().unwrap_or(-1),
+                _ => 0,
+            };
+            let r = max + 1 + i;
+            if r < 0 {
+                return Err(format!("{name}[{key}]: bad array subscript"));
+            }
+            return Ok(r);
+        }
+        Ok(i)
+    }
+
+    pub fn get_elem(&mut self, name: &str, key: &str) -> Result<Option<String>, String> {
+        if self.is_assoc(name) {
+            let k = self.expand_string(key).map_err(|e| e.0)?;
+            return Ok(match self.vars.get(name).and_then(|v| v.arr.as_ref()) {
+                Some(Arr::Assoc(m)) => m.get(&k).cloned(),
+                _ => None,
+            });
+        }
+        let i = self.index_of(name, key)?;
+        Ok(match self.vars.get(name) {
+            Some(Var {
+                arr: Some(Arr::Indexed(m)),
+                ..
+            }) => m.get(&i).cloned(),
+            Some(v) if i == 0 => Some(v.value.clone()),
+            _ => None,
+        })
+    }
+
+    pub fn set_elem(&mut self, name: &str, key: &str, value: &str) -> Result<(), String> {
+        if self.is_assoc(name) {
+            let k = self.expand_string(key).map_err(|e| e.0)?;
+            if let Some(Var {
+                arr: Some(Arr::Assoc(m)),
+                ..
+            }) = self.vars.get_mut(name)
+            {
+                m.insert(k, value.to_string());
+            }
+            return Ok(());
+        }
+        let i = self.index_of(name, key)?;
+        self.declare_array(name, false);
+        if let Some(v) = self.vars.get_mut(name) {
+            if let Some(Arr::Indexed(m)) = &mut v.arr {
+                m.insert(i, value.to_string());
+            }
+            if i == 0 {
+                v.value = value.to_string();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn unset_elem(&mut self, name: &str, key: &str) -> Result<(), String> {
+        if self.is_assoc(name) {
+            let k = self.expand_string(key).map_err(|e| e.0)?;
+            if let Some(Var {
+                arr: Some(Arr::Assoc(m)),
+                ..
+            }) = self.vars.get_mut(name)
+            {
+                m.remove(&k);
+            }
+            return Ok(());
+        }
+        let i = self.index_of(name, key)?;
+        if let Some(v) = self.vars.get_mut(name) {
+            if let Some(Arr::Indexed(m)) = &mut v.arr {
+                m.remove(&i);
+            }
+            if i == 0 {
+                v.value.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// All values (in index/key order). A plain variable is a 1-element array.
+    pub fn array_values(&self, name: &str) -> Vec<String> {
+        match self.vars.get(name) {
+            Some(Var {
+                arr: Some(Arr::Indexed(m)),
+                ..
+            }) => m.values().cloned().collect(),
+            Some(Var {
+                arr: Some(Arr::Assoc(m)),
+                ..
+            }) => m.values().cloned().collect(),
+            Some(v) => vec![v.value.clone()],
+            None => Vec::new(),
+        }
+    }
+
+    pub fn array_keys(&self, name: &str) -> Vec<String> {
+        match self.vars.get(name) {
+            Some(Var {
+                arr: Some(Arr::Indexed(m)),
+                ..
+            }) => m.keys().map(|k| k.to_string()).collect(),
+            Some(Var {
+                arr: Some(Arr::Assoc(m)),
+                ..
+            }) => m.keys().cloned().collect(),
+            Some(_) => vec!["0".into()],
+            None => Vec::new(),
+        }
+    }
+
+    /// Handle array-ish assignments. None = it was a plain scalar assignment.
+    pub fn assign_array_word(
+        &mut self,
+        k: &str,
+        raw: &str,
+        append: bool,
+    ) -> Option<Result<(), String>> {
+        if let Some((name, rest)) = k.split_once('[') {
+            let sub = rest.strip_suffix(']').unwrap_or(rest).to_string();
+            let name = name.to_string();
+            return Some((|| {
+                let v = self.expand_assign(raw).map_err(|e| e.0)?;
+                let v = if append {
+                    self.get_elem(&name, &sub)?.unwrap_or_default() + &v
+                } else {
+                    v
+                };
+                self.set_elem(&name, &sub, &v)
+            })());
+        }
+        if raw.len() >= 2 && raw.starts_with('(') && raw.ends_with(')') {
+            return Some((|| {
+                let mut items = Vec::new();
+                for w in crate::parser::split_words(&raw[1..raw.len() - 1]) {
+                    if w.starts_with('[')
+                        && let Some(close) = w.find("]=")
+                    {
+                        let key = w[1..close].to_string();
+                        let v = self.expand_assign(&w[close + 2..]).map_err(|e| e.0)?;
+                        items.push((Some(key), v));
+                        continue;
+                    }
+                    for f in self.expand_fields(&w).map_err(|e| e.0)? {
+                        items.push((None, f));
+                    }
+                }
+                self.assign_array(k, items, append)
+            })());
+        }
+        None
+    }
+
+    /// name=(a b [k]=v ...) — `append` for +=(...)
+    pub fn assign_array(
+        &mut self,
+        name: &str,
+        items: Vec<(Option<String>, String)>,
+        append: bool,
+    ) -> Result<(), String> {
+        let assoc = self.is_assoc(name);
+        if !append {
+            let exported = self.vars.get(name).map(|v| v.exported).unwrap_or(false);
+            self.vars.insert(
+                name.to_string(),
+                Var {
+                    value: String::new(),
+                    exported,
+                    arr: Some(if assoc {
+                        Arr::Assoc(BTreeMap::new())
+                    } else {
+                        Arr::Indexed(BTreeMap::new())
+                    }),
+                },
+            );
+        } else {
+            self.declare_array(name, assoc);
+        }
+        let mut next: i64 = match self.vars.get(name).and_then(|v| v.arr.as_ref()) {
+            Some(Arr::Indexed(m)) => m.keys().next_back().map(|k| k + 1).unwrap_or(0),
+            _ => 0,
+        };
+        for (key, val) in items {
+            match key {
+                Some(k) => {
+                    self.set_elem(name, &k, &val)?;
+                    if !assoc && let Ok(i) = self.index_of(name, &k) {
+                        next = i + 1;
+                    }
+                }
+                None => {
+                    if assoc {
+                        return Err(format!(
+                            "{name}: must use subscript when assigning associative array"
+                        ));
+                    }
+                    self.set_elem(name, &next.to_string(), &val)?;
+                    next += 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `local NAME`: remember the old value so the function's exit restores it.
@@ -270,7 +529,7 @@ impl Shell {
             Ok(list) => match self.run_list(&list) {
                 Flow::Exit(c) => {
                     if top || self.in_subshell {
-                        flush_and_exit(c);
+                        self.exit_now(c);
                     }
                     c
                 }
@@ -294,6 +553,10 @@ impl Shell {
             let f = self.run_andor(ao);
             if f != Flow::Normal {
                 return f;
+            }
+            let t = self.run_pending_traps();
+            if t != Flow::Normal {
+                return t;
             }
         }
         Flow::Normal
@@ -335,24 +598,34 @@ impl Shell {
         if n > 0 {
             self.cond_depth -= 1;
         }
-        if f == Flow::Normal
-            && self.errexit
+        let failed = f == Flow::Normal
             && self.last_status != 0
             && self.cond_depth == 0
             && !last_ran_negated
-            && last_ran_idx == n
+            && last_ran_idx == n;
+        if failed
+            && !self.in_trap
+            && let Some(action) = self.traps.get(&crate::jobs::ERR_TRAP).cloned()
         {
+            let st = self.last_status;
+            let t = self.run_trap_action(&action);
+            if t != Flow::Normal {
+                return t;
+            }
+            self.last_status = st;
+        }
+        if failed && self.errexit {
             return Flow::Exit(self.last_status);
         }
         f
     }
 
     fn run_background(&mut self, ao: &AndOr) -> Flow {
+        let _ = std::io::stdout().flush();
         // SAFETY: fork in a single-threaded program
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            self.in_subshell = true;
-            self.interactive = false;
+            self.child_setup(0, false);
             let mut fg = ao.clone();
             fg.background = false;
             let f = self.run_andor(&fg);
@@ -361,8 +634,10 @@ impl Shell {
             } else {
                 self.last_status
             };
-            flush_and_exit(code);
+            self.exit_now(code);
         }
+        let mut pgid = 0;
+        self.parent_setup(pid, &mut pgid);
         self.last_bg = Some(pid);
         let id = self.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
         if self.interactive {
@@ -370,35 +645,13 @@ impl Shell {
         }
         self.jobs.push(Job {
             id,
-            pid,
+            pgid: if pgid == 0 { pid } else { pgid },
+            pids: vec![pid],
             cmd: describe_andor(ao),
+            stopped: false,
         });
         self.last_status = 0;
         Flow::Normal
-    }
-
-    /// Report finished background jobs (interactive prompt does this).
-    pub fn reap_jobs(&mut self) {
-        let mut done = Vec::new();
-        for j in &self.jobs {
-            let mut st = 0;
-            // SAFETY: valid pointer
-            let r = unsafe { libc::waitpid(j.pid, &mut st, libc::WNOHANG) };
-            if r == j.pid || r == -1 {
-                done.push((j.id, j.cmd.clone(), decode_status(st)));
-            }
-        }
-        for (id, cmd, code) in done {
-            self.jobs.retain(|j| j.id != id);
-            if self.interactive {
-                let what = if code == 0 {
-                    "Done".to_string()
-                } else {
-                    format!("Exit {code}")
-                };
-                eprintln!("[{id}]+  {what:<24}{cmd}");
-            }
-        }
     }
 
     fn run_pipeline(&mut self, p: &Pipeline) -> Flow {
@@ -421,6 +674,7 @@ impl Shell {
         let _ = std::io::stdout().flush();
         let mut pids = Vec::new();
         let mut prev_read: i32 = -1;
+        let mut pgid = 0;
         for (i, cmd) in cmds.iter().enumerate() {
             let last = i + 1 == cmds.len();
             let mut fds = [-1i32; 2];
@@ -442,16 +696,16 @@ impl Shell {
                         libc::close(fds[1]);
                         libc::close(fds[0]);
                     }
-                    self.in_subshell = true;
-                    self.interactive = false;
+                    self.child_setup(pgid, true);
                     let f = self.run_command(cmd, true);
                     let code = if let Flow::Exit(c) = f {
                         c
                     } else {
                         self.last_status
                     };
-                    flush_and_exit(code);
+                    self.exit_now(code);
                 }
+                self.parent_setup(pid, &mut pgid);
                 if prev_read != -1 {
                     libc::close(prev_read);
                 }
@@ -462,10 +716,12 @@ impl Shell {
                 pids.push(pid);
             }
         }
-        let mut statuses = Vec::new();
-        for pid in pids {
-            statuses.push(wait_pid(pid));
-        }
+        let desc = cmds
+            .iter()
+            .map(describe_cmd)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let statuses = self.wait_fg(&pids, pgid, &desc);
         self.last_status = if self.pipefail {
             statuses
                 .iter()
@@ -501,17 +757,19 @@ impl Shell {
                 // SAFETY: fork in a single-threaded program
                 let pid = unsafe { libc::fork() };
                 if pid == 0 {
-                    self.in_subshell = true;
-                    self.interactive = false;
+                    self.child_setup(0, true);
                     let f = self.with_redirs(redirs, |sh| sh.run_list(list));
                     let code = if let Flow::Exit(c) = f {
                         c
                     } else {
                         self.last_status
                     };
-                    flush_and_exit(code);
+                    self.exit_now(code);
                 }
-                self.last_status = wait_pid(pid);
+                let mut pgid = 0;
+                self.parent_setup(pid, &mut pgid);
+                let st = self.wait_fg(&[pid], if pgid == 0 { pid } else { pgid }, "( ... )");
+                self.last_status = st[0];
                 Flow::Normal
             }
             Command::Group(list, redirs) => self.with_redirs(redirs, |sh| sh.run_list(list)),
@@ -742,6 +1000,17 @@ impl Shell {
         if words.first().map(|w| w == "[[").unwrap_or(false) {
             return self.run_double_bracket(&words[1..]);
         }
+        // declaration builtins see `name=(...)` / `name=value` as assignments, not words
+        if let Some(w0) = words.first()
+            && matches!(
+                w0.as_str(),
+                "local" | "declare" | "typeset" | "export" | "readonly"
+            )
+            && assigns.is_empty()
+            && !self.functions.contains_key(w0)
+        {
+            return self.with_redirs(redirs, |sh| sh.run_declaration(&words[0], &words[1..]));
+        }
         for w in words {
             match self.expand_fields(w) {
                 Ok(f) => argv.extend(f),
@@ -755,6 +1024,17 @@ impl Shell {
                 Some(base) => (base.to_string(), true),
                 None => (k.clone(), false),
             };
+            // arrays: a=(x y z), a+=(w), a[i]=v
+            if let Some(err) = self.assign_array_word(&k, raw, append) {
+                match err {
+                    Ok(()) => continue,
+                    Err(m) => {
+                        eprintln!("{}: {m}", self.source_name);
+                        self.last_status = 1;
+                        return Flow::Normal;
+                    }
+                }
+            }
             match self.expand_assign(raw) {
                 Ok(v) => {
                     let v = if append {
@@ -940,16 +1220,24 @@ impl Shell {
         // SAFETY: fork in a single-threaded program
         let pid = unsafe { libc::fork() };
         if pid == 0 {
+            self.child_setup(0, true);
             if let Err(m) = self.apply_redirs(redirs, false) {
                 eprintln!("{}: {m}", self.source_name);
                 flush_and_exit(1);
             }
             self.exec_external(&argv, &values);
         }
-        self.last_status = wait_pid(pid);
+        let mut pgid = 0;
+        self.parent_setup(pid, &mut pgid);
+        let st = self.wait_fg(&[pid], if pgid == 0 { pid } else { pgid }, &argv.join(" "));
+        self.last_status = st[0];
         if self.interactive && self.last_status > 128 {
             let sig = self.last_status - 128;
-            if sig != libc::SIGINT && sig != libc::SIGPIPE {
+            if sig != libc::SIGINT
+                && sig != libc::SIGPIPE
+                && sig != libc::SIGTSTP
+                && sig != libc::SIGSTOP
+            {
                 // SAFETY: strsignal returns a static string
                 let s = unsafe { std::ffi::CStr::from_ptr(libc::strsignal(sig)) }
                     .to_string_lossy()
@@ -1211,6 +1499,13 @@ pub fn trace_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+fn describe_cmd(c: &Command) -> String {
+    match c {
+        Command::Simple { words, .. } => words.join(" "),
+        _ => "(compound)".into(),
     }
 }
 

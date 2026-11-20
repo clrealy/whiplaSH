@@ -12,23 +12,27 @@ pub const BUILTINS: &[&str] = &[
     "[",
     "alias",
     "and",
+    "bg",
     "break",
     "builtin",
     "cd",
     "command",
     "continue",
     "declare",
+    "disown",
     "echo",
     "eval",
     "exec",
     "exit",
     "export",
     "false",
+    "fg",
     "functions",
     "getopts",
     "help",
     "history",
     "jobs",
+    "kill",
     "let",
     "local",
     "not",
@@ -41,6 +45,7 @@ pub const BUILTINS: &[&str] = &[
     "shift",
     "source",
     "test",
+    "trap",
     "true",
     "type",
     "typeset",
@@ -160,6 +165,15 @@ pub fn run(sh: &mut Shell, argv: &[String]) -> Flow {
         "unset" => {
             let funcs = args.first().map(|a| a == "-f").unwrap_or(false);
             for a in args.iter().filter(|a| !a.starts_with('-')) {
+                if let Some((n, rest)) = a.split_once('[').filter(|_| !funcs) {
+                    let k = rest.strip_suffix(']').unwrap_or(rest);
+                    if k == "@" || k == "*" {
+                        sh.unset_var(n);
+                    } else if let Err(m) = sh.unset_elem(n, k) {
+                        eprintln!("{}: unset: {m}", sh.source_name);
+                    }
+                    continue;
+                }
                 if funcs {
                     sh.functions.remove(a);
                 } else if sh.vars.contains_key(a) {
@@ -255,37 +269,38 @@ pub fn run(sh: &mut Shell, argv: &[String]) -> Flow {
             }
             0
         }
-        "jobs" => {
-            for j in &sh.jobs {
-                println!("[{}]  Running                 {}", j.id, j.cmd);
-            }
-            0
-        }
+        "jobs" => sh.builtin_jobs(args),
+        "fg" => return sh.builtin_fg(args),
+        "bg" => return sh.builtin_bg(args),
+        "kill" => sh.builtin_kill(args),
+        "disown" => sh.builtin_disown(args),
+        "trap" => sh.builtin_trap(args),
         "wait" => {
             let mut code = 0;
             if args.is_empty() {
-                let pids: Vec<i32> = sh.jobs.iter().map(|j| j.pid).collect();
+                let pids: Vec<i32> = sh.jobs.iter().flat_map(|j| j.pids.clone()).collect();
                 for p in pids {
                     code = crate::shell::wait_pid(p);
                 }
                 sh.jobs.clear();
             } else {
                 for a in args {
-                    let pid = if let Some(id) = a.strip_prefix('%') {
+                    let pids: Vec<i32> = if let Some(id) = a.strip_prefix('%') {
                         sh.jobs
                             .iter()
-                            .find(|j| j.id.to_string() == id)
-                            .map(|j| j.pid)
-                            .unwrap_or(-1)
+                            .filter(|j| j.id.to_string() == id)
+                            .flat_map(|j| j.pids.clone())
+                            .collect()
                     } else {
-                        a.parse().unwrap_or(-1)
+                        a.parse().map(|p| vec![p]).unwrap_or_default()
                     };
-                    code = if pid > 0 {
-                        crate::shell::wait_pid(pid)
-                    } else {
-                        127
-                    };
-                    sh.jobs.retain(|j| j.pid != pid);
+                    if pids.is_empty() {
+                        code = 127;
+                    }
+                    for p in &pids {
+                        code = crate::shell::wait_pid(*p);
+                    }
+                    sh.jobs.retain(|j| !j.pids.iter().any(|p| pids.contains(p)));
                 }
             }
             code
@@ -846,6 +861,7 @@ fn read(sh: &mut Shell, args: &[String]) -> i32 {
     let mut prompt: Option<String> = None;
     let mut delim = b'\n';
     let mut names = Vec::new();
+    let mut array_name: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -859,6 +875,10 @@ fn read(sh: &mut Shell, args: &[String]) -> i32 {
                 delim = args.get(i).and_then(|d| d.bytes().next()).unwrap_or(0);
             }
             "-s" => {}
+            "-a" => {
+                i += 1;
+                array_name = args.get(i).cloned();
+            }
             a if a.starts_with('-') && a.len() > 1 => {
                 for c in a[1..].chars() {
                     if c == 'r' {
@@ -896,6 +916,20 @@ fn read(sh: &mut Shell, args: &[String]) -> i32 {
         escaped_pos.push(false);
     }
     let line = String::from_utf8_lossy(&buf).into_owned();
+    if let Some(an) = array_name {
+        let ifs: Vec<char> = sh
+            .get_var("IFS")
+            .unwrap_or(" \t\n".into())
+            .chars()
+            .collect();
+        let items: Vec<(Option<String>, String)> = line
+            .split(|c| ifs.contains(&c))
+            .filter(|w| !w.is_empty())
+            .map(|w| (None, w.to_string()))
+            .collect();
+        let _ = sh.assign_array(&an, items, false);
+        return i32::from(!got_delim);
+    }
     if names.is_empty() {
         sh.set_var("REPLY", &line);
         return i32::from(!got_delim);
@@ -1445,4 +1479,181 @@ fn getopts(sh: &mut Shell, args: &[String]) -> i32 {
     sh.getopts_pos = next_pos;
     sh.set_var("OPTIND", &optind.to_string());
     0
+}
+
+impl Shell {
+    /// local / declare / typeset / export / readonly, working on raw words so
+    /// `declare -a a=(1 2 3)` and `local x="a b"` assign instead of splitting.
+    pub fn run_declaration(&mut self, cmd: &str, raw: &[String]) -> Flow {
+        let mut flags = String::new();
+        let mut targets: Vec<(String, Option<String>, bool)> = Vec::new(); // (name, raw value, append)
+        for w in raw {
+            if parser::is_assignment(w) {
+                let mut depth = 0;
+                let mut at = 0;
+                for (i, c) in w.char_indices() {
+                    match c {
+                        '[' => depth += 1,
+                        ']' => depth -= 1,
+                        '=' if depth == 0 => {
+                            at = i;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let (k, v) = (&w[..at], &w[at + 1..]);
+                let (k, append) = match k.strip_suffix('+') {
+                    Some(b) => (b, true),
+                    None => (k, false),
+                };
+                targets.push((k.to_string(), Some(v.to_string()), append));
+                continue;
+            }
+            let expanded = match self.expand_fields(w) {
+                Ok(f) => f,
+                Err(e) => return self.expand_failed(e),
+            };
+            for e in expanded {
+                if (e.starts_with('-') || e.starts_with('+')) && e.len() > 1 && targets.is_empty() {
+                    flags.push_str(&e[1..]);
+                } else if let Some((k, v)) = e.split_once('=') {
+                    targets.push((
+                        k.to_string(),
+                        Some(format!("'{}'", v.replace('\'', "'\\''"))),
+                        false,
+                    ));
+                } else {
+                    targets.push((e, None, false));
+                }
+            }
+        }
+        let is_local = cmd == "local"
+            || ((cmd == "declare" || cmd == "typeset")
+                && self.func_depth > 0
+                && !flags.contains('g'));
+        if cmd == "local" && self.func_depth == 0 {
+            eprintln!(
+                "{}: local: can only be used in a function",
+                self.source_name
+            );
+            self.last_status = 1;
+            return Flow::Normal;
+        }
+        let export = cmd == "export" || flags.contains('x');
+        if targets.is_empty() {
+            if flags.contains('f') || flags.contains('F') {
+                let mut names: Vec<_> = self.functions.keys().cloned().collect();
+                names.sort();
+                for n in names {
+                    println!("declare -f {n}");
+                }
+            } else if cmd == "export" || flags.contains('x') || flags.contains('p') {
+                let mut v: Vec<_> = self
+                    .vars
+                    .iter()
+                    .filter(|(_, v)| v.exported || cmd != "export")
+                    .collect();
+                v.sort_by(|a, b| a.0.cmp(b.0));
+                for (k, var) in v {
+                    if var.exported {
+                        println!(
+                            "declare -x {k}=\"{}\"",
+                            var.value
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"")
+                                .replace('$', "\\$")
+                        );
+                    }
+                }
+            }
+            self.last_status = 0;
+            return Flow::Normal;
+        }
+        let mut code = 0;
+        for (name, value, append) in targets {
+            let base = name.split('[').next().unwrap_or(&name).to_string();
+            if !parser::is_name(&base) {
+                eprintln!(
+                    "{}: {cmd}: `{name}': not a valid identifier",
+                    self.source_name
+                );
+                code = 1;
+                continue;
+            }
+            if flags.contains('p') {
+                self.print_decl(&base);
+                continue;
+            }
+            if is_local {
+                self.make_local(&base);
+                if value.is_none() && !flags.contains('a') && !flags.contains('A') {
+                    self.vars.remove(&base);
+                    self.set_var(&base, "");
+                }
+            }
+            if flags.contains('A') {
+                self.declare_array(&base, true);
+            } else if flags.contains('a') {
+                self.declare_array(&base, false);
+            }
+            if let Some(raw) = value {
+                match self.assign_array_word(&name, &raw, append) {
+                    Some(Ok(())) => {}
+                    Some(Err(m)) => {
+                        eprintln!("{}: {m}", self.source_name);
+                        code = 1;
+                    }
+                    None => match self.expand_assign(&raw) {
+                        Ok(v) => {
+                            let v = if append {
+                                self.get_var(&base).unwrap_or_default() + &v
+                            } else {
+                                v
+                            };
+                            self.set_var(&base, &v);
+                        }
+                        Err(e) => return self.expand_failed(e),
+                    },
+                }
+            }
+            if export {
+                if flags.contains('n') && cmd == "export" {
+                    if let Some(v) = self.vars.get_mut(&base) {
+                        v.exported = false;
+                    }
+                } else {
+                    self.export_var(&base, None);
+                }
+            }
+        }
+        self.last_status = code;
+        Flow::Normal
+    }
+
+    fn print_decl(&self, name: &str) {
+        let q = |v: &str| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""));
+        match self.vars.get(name) {
+            Some(crate::shell::Var {
+                arr: Some(crate::shell::Arr::Indexed(m)),
+                ..
+            }) => {
+                let body: Vec<String> = m.iter().map(|(k, v)| format!("[{k}]={}", q(v))).collect();
+                println!("declare -a {name}=({})", body.join(" "));
+            }
+            Some(crate::shell::Var {
+                arr: Some(crate::shell::Arr::Assoc(m)),
+                ..
+            }) => {
+                let body: Vec<String> = m.iter().map(|(k, v)| format!("[{k}]={}", q(v))).collect();
+                println!("declare -A {name}=({} )", body.join(" "));
+            }
+            Some(v) => println!(
+                "declare -{} {name}={}",
+                if v.exported { "x" } else { "-" },
+                q(&v.value)
+            ),
+            None => eprintln!("{}: declare: {name}: not found", self.source_name),
+        }
+    }
 }

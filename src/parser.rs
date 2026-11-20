@@ -336,7 +336,44 @@ pub fn is_assignment(w: &str) -> bool {
     while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
         i += 1;
     }
+    // NAME[subscript]=
+    if i < b.len() && b[i] == b'[' {
+        let mut depth = 0;
+        while i < b.len() {
+            if b[i] == b'[' {
+                depth += 1;
+            } else if b[i] == b']' {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    break;
+                }
+            }
+            i += 1;
+        }
+    }
     i < b.len() && (b[i] == b'=' || (b[i] == b'+' && b.get(i + 1) == Some(&b'=')))
+}
+
+/// Split source text into raw words (for array literals like `(a "b c" [k]=v)`).
+pub fn split_words(src: &str) -> Vec<String> {
+    let mut lx = Lexer::new(src);
+    lx.cmd_pos = false;
+    let mut out = Vec::new();
+    while let Ok(t) = lx.next() {
+        match t {
+            Tok::Word(w) => {
+                out.push(w);
+                lx.cmd_pos = false;
+            }
+            Tok::Newline => {
+                lx.cmd_pos = false;
+            }
+            Tok::Eof => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 pub fn is_name(w: &str) -> bool {
@@ -977,8 +1014,20 @@ impl Parser {
             match self.peek().clone() {
                 Tok::Word(w) => {
                     if words.is_empty() && is_assignment(&w) {
-                        let (k, v) = w.split_once('=').unwrap();
-                        assigns.push((k.to_string(), v.to_string()));
+                        let mut depth = 0;
+                        let mut at = 0;
+                        for (i, c) in w.char_indices() {
+                            match c {
+                                '[' => depth += 1,
+                                ']' => depth -= 1,
+                                '=' if depth == 0 => {
+                                    at = i;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        assigns.push((w[..at].to_string(), w[at + 1..].to_string()));
                     } else {
                         words.push(w);
                     }
